@@ -1,0 +1,505 @@
+<title>Escape</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+@font-face { font-family: "EscapeFont"; src: url(data:font/ttf;base64,__FONT2__) format("truetype"); font-display: block; }
+
+/* One screen: the 16:9 exam room is the page; a thin caption row sits under it. Single dark-green look taken from the game's own MainBG. */
+:root {
+  --ground: #00240c;      /* MainBG top band */
+  --band: #27744a;        /* stripe green */
+  --grass: #82c96a;       /* playfield green */
+  --ink: #d9eed0;
+  --ink-dim: #8fbf96;
+  --rule: rgba(130, 201, 106, 0.28);
+  --display: "EscapeFont", "Courier New", monospace;
+  --body: ui-sans-serif, system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--body);
+  box-sizing: border-box;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding-block: 12px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.stage {
+  width: min(100%, calc((100vh - 96px) * 16 / 9));
+  width: min(100%, calc((100dvh - 96px) * 16 / 9));
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
+  position: relative;
+  outline: 1px solid var(--rule);
+}
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+canvas:focus-visible { outline: 2px solid var(--grass); outline-offset: 3px; }
+.bar {
+  width: min(100%, calc((100vh - 96px) * 16 / 9));
+  width: min(100%, calc((100dvh - 96px) * 16 / 9));
+  max-width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  font-size: 13px;
+  color: var(--ink-dim);
+}
+.bar .keys { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; min-width: 0; }
+kbd {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  padding: 1px 6px;
+}
+.toggles { display: flex; gap: 8px; }
+.toggles button {
+  font: inherit;
+  color: var(--ink-dim);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  min-height: 32px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.toggles button[aria-pressed="true"] { color: var(--ground); background: var(--grass); border-color: var(--grass); }
+.toggles button:focus-visible { outline: 2px solid var(--grass); outline-offset: 2px; }
+#perf {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  font: 12px/1.5 var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: #e9ffe0;
+  background: rgba(0, 36, 12, 0.82);
+  padding: 6px 10px;
+  border-radius: 3px;
+  pointer-events: none;
+  white-space: pre;
+}
+.era { font-family: var(--display); letter-spacing: 0.06em; color: var(--ink-dim); }
+@media (max-width: 520px) { .era { display: none; } }
+.rotate { display: none; }
+@media (orientation: portrait) and (max-width: 600px) { .rotate { display: inline; } }
+</style>
+
+<div class="stage" id="stage">
+  <canvas id="game" tabindex="0" aria-label="Escape：按空格或点击画面跳跃，躲开红叉，接住 1,0"></canvas>
+  <output id="perf" hidden></output>
+</div>
+<div class="bar">
+  <div class="keys">
+    <span><kbd>Space</kbd> / <kbd>↑</kbd> / 点击画面 = 跳</span>
+    <span><kbd>P</kbd> 暂停</span>
+    <span class="era">2019 Swing → Canvas</span>
+    <span class="rotate">横屏玩画面更大</span>
+  </div>
+  <div class="toggles">
+    <button id="soundBtn" type="button" aria-pressed="true">声音</button>
+    <button id="perfBtn" type="button" aria-pressed="false">帧率</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+const IMG = __IMG_JSON__;
+const SND = __SND_JSON__;
+
+const W = 1280, H = 720;
+const PLAYER_X = 390;          // (1280 / 2 - 50) - 200, as in the Swing version
+const STAND_Y = 510;
+const JUMP_MS = 1000, JUMP_PEAK = 320;
+const BONUS_SLOTS = [1, 4, 7, 11, 14, 15, 18, 22, 23];
+const ROW1_SLOTS = [1, 3, 4, 6, 7, 11, 16, 18, 21, 24];
+const ROW2_SLOTS = [2, 8, 10, 14, 15, 20, 23];
+const GRADES = { 100: "1,0", 95: "1,3", 90: "1,7", 85: "2,0", 80: "2,5", 75: "2,7", 70: "3,0", 65: "3,5", 60: "4,0" };
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const stage = document.getElementById("stage");
+const perfEl = document.getElementById("perf");
+
+// ---- assets: everything decoded before the first frame (Swing loaded lazily, mid-game) ----
+const img = {};
+let audio = null, gain = null, soundOn = true;
+const buffers = {};
+
+function b64bytes(uri) {
+  const bin = atob(uri.slice(uri.indexOf(",") + 1));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
+
+async function loadAssets() {
+  await Promise.all(Object.entries(IMG).map(([k, src]) => {
+    const im = new Image();
+    im.src = src;
+    img[k] = im;
+    return im.decode();
+  }));
+  await document.fonts.load('50px "EscapeFont"');
+  try {
+    audio = new (window.AudioContext || window.webkitAudioContext)();
+    gain = audio.createGain();
+    gain.gain.value = 0.45;
+    gain.connect(audio.destination);
+    await Promise.all(Object.entries(SND).map(async ([k, src]) => {
+      buffers[k] = await audio.decodeAudioData(b64bytes(src));
+    }));
+  } catch (e) {
+    audio = null; // the game still runs silently
+  }
+}
+
+function play(name) {
+  if (!audio || !soundOn || !buffers[name]) return;
+  if (audio.state !== "running") audio.resume();
+  const src = audio.createBufferSource();
+  src.buffer = buffers[name];
+  src.connect(gain);
+  src.start();
+}
+
+// ---- game state ----
+let view = "loading";       // loading | menu | tutorial | game | roundEnd | gameOver
+let paused = false;
+const g = {};
+
+function speedTarget() {
+  // Same formula as TimeControl: (xspeed + (0.1 * bonus - 0.1 * mistake) * round * 2) * 100 px/s,
+  // clamped so a bad run in round 2+ cannot stall the scroll at zero.
+  const s = (2 + (0.1 * g.bonusHit - 0.1 * g.mistakeHit) * g.round * 2) * 100;
+  return Math.min(450, Math.max(110, s));
+}
+
+function createObjects() {
+  const objs = [];
+  for (let slot = 0; slot < 25; slot++) {
+    if (Math.random() < 0.5) continue;
+    const bonus = BONUS_SLOTS.includes(slot);
+    objs.push({
+      x: 440 + 1920 / 2 + slot * 200,
+      row: ROW1_SLOTS.includes(slot) ? 1 : ROW2_SLOTS.includes(slot) ? 2 : 3,
+      bonus,
+      pic: Math.floor(Math.random() * (bonus ? 2 : 4)),
+      used: false,
+    });
+  }
+  return objs;
+}
+
+function startRound(round) {
+  Object.assign(g, {
+    round, point: 80, cursor: 440, bonusHit: 0, mistakeHit: 0,
+    jumpT: -1, queuedAt: -Infinity, now: 0, tip: null, objs: createObjects(),
+  });
+  g.speed = speedTarget();
+  view = "game";
+  paused = false;
+}
+
+function rowY(row) { return 200 + (row - 1) * 155; }
+function jumpHeight() {
+  if (g.jumpT < 0) return 0;
+  const u = (g.jumpT - JUMP_MS / 2) / (JUMP_MS / 2);
+  return JUMP_PEAK * (1 - u * u);
+}
+
+function pressJump() {
+  if (view !== "game") return;
+  if (paused) { paused = false; return; }
+  if (g.jumpT < 0) { g.jumpT = 0; return; }
+  g.queuedAt = g.now; // pressed while airborne: take off again on landing if it was close
+}
+
+function update(dt) {
+  g.now += dt;
+  const k = 1 - Math.exp(-dt / 180);
+  g.speed += (speedTarget() - g.speed) * k;
+  g.cursor += g.speed * dt / 1000;
+
+  if (g.jumpT >= 0) {
+    g.jumpT += dt;
+    if (g.jumpT >= JUMP_MS) {
+      g.jumpT = g.now - g.queuedAt < 140 ? 0 : -1;
+    }
+  }
+
+  if (g.point >= 90) {
+    for (const o of g.objs) if (!o.used && o.bonus && o.x - g.cursor < 1920) o.bonus = false;
+  }
+
+  const playerY = STAND_Y + 50 - jumpHeight();
+  for (const o of g.objs) {
+    if (o.used) continue;
+    if (Math.abs(o.x - g.cursor - PLAYER_X) < 50 && Math.abs(playerY - (rowY(o.row) + 25)) <= 25) {
+      o.used = true;
+      if (o.bonus) { g.point += 5; g.bonusHit++; } else { g.point -= 10; g.mistakeHit++; }
+      g.tip = { x: o.x, row: o.row, bonus: o.bonus, t: 0 };
+      play("ding");
+    }
+  }
+  if (g.tip && (g.tip.t += dt) >= 1000) g.tip = null;
+
+  if (g.point < 0) { view = "gameOver"; focusIdx = 0; return; }
+  const last = g.objs.length ? g.objs[g.objs.length - 1].x : 440;
+  if (g.cursor > last + 60) { view = "roundEnd"; focusIdx = 0; }
+}
+
+// ---- drawing ----
+function text(str, x, y, font, color, align = "left", base = "middle") {
+  ctx.font = font;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = base;
+  ctx.fillText(str, x, y);
+}
+
+const DIALOG_BOLD = (px) => `bold ${px}px Arial, Helvetica, sans-serif`;
+const DISPLAY = (px, bold) => `${bold ? "bold " : ""}${px}px "EscapeFont", monospace`;
+
+let buttons = [];
+let focusIdx = 0;
+let hoverIdx = -1;
+let keyboardFocus = false;
+
+function button(label, x, y, w, h, action, hit) {
+  buttons.push({ label, x, y, w, h, action, hit: hit || [x - 10, y - 25, w + 20, h + 50] });
+}
+
+function drawButtons() {
+  buttons.forEach((b, i) => {
+    const active = i === hoverIdx || (keyboardFocus && i === focusIdx);
+    if (active) { ctx.fillStyle = "rgba(255,255,255,0.22)"; ctx.fillRect(b.x, b.y, b.w, b.h); }
+    ctx.strokeStyle = active ? "#1d3d25" : "#7f86b8";
+    ctx.lineWidth = active ? 2 : 1;
+    ctx.strokeRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1);
+    let px = 18;
+    ctx.font = DISPLAY(px, true);
+    while (px > 11 && ctx.measureText(b.label).width > b.w - 20) ctx.font = DISPLAY(--px, true);
+    text(b.label, b.x + b.w / 2, b.y + b.h / 2 + 1, DISPLAY(px, true), "#333333", "center");
+  });
+}
+
+function drawMenu() {
+  ctx.drawImage(img.MainBG, 0, 0, W, H);
+  text("Escape", 440, 350, DISPLAY(60), "#333333");
+  if (view === "menu") {
+    button("START", 565, 400, 150, 50, () => { play("pong"); startRound(1); });
+    button("TUTORIAL", 540, 500, 200, 50, () => { play("pong"); view = "tutorial"; focusIdx = 0; });
+  } else {
+    ctx.drawImage(img.HelpBG, 300, 300, 640, 360);
+    text("Before start", 340, 350, DISPLAY(30), "#333333");
+    text("Press SPACE (or tap) to jump through the mistakes.", 400, 425, DIALOG_BOLD(20), "#333333");
+    text("Catch the 1,0 cards. Get at least 60 points to pass!", 400, 475, DIALOG_BOLD(20), "#333333");
+    button("BACK", 700, 600, 200, 50, () => { view = "menu"; focusIdx = 0; });
+  }
+}
+
+function drawGame() {
+  ctx.drawImage(img.GameBG, 0, 0, W, H);
+
+  for (const o of g.objs) {
+    if (o.used) continue;
+    const sx = o.x - g.cursor;
+    if (sx < -60 || sx > W) continue;
+    const sprite = o.bonus ? img["bonus" + o.pic] : img["mistake" + o.pic];
+    ctx.drawImage(sprite, Math.round(sx), rowY(o.row));
+  }
+
+  const py = Math.round(STAND_Y - jumpHeight());
+  ctx.drawImage(g.jumpT >= 0 ? img.player1 : img.player2, PLAYER_X, py);
+
+  if (g.tip) {
+    ctx.globalAlpha = g.tip.t > 800 ? (1000 - g.tip.t) / 200 : 1;
+    ctx.drawImage(g.tip.bonus ? img.tip1 : img.tip2, Math.round(g.tip.x - g.cursor), rowY(g.tip.row));
+    ctx.globalAlpha = 1;
+  }
+
+  text(String(g.point), 1000, 200, DISPLAY(50, true), "#333333", "left", "alphabetic");
+  text("ROUND " + g.round, 1004, 236, DISPLAY(18, true), "#2c5a39", "left", "alphabetic");
+
+  if (paused) {
+    ctx.fillStyle = "rgba(0,36,12,0.55)";
+    ctx.fillRect(0, 0, W, H);
+    text("PAUSED", W / 2, H / 2 - 20, DISPLAY(60), "#d9eed0", "center");
+    text("press SPACE or tap to go on", W / 2, H / 2 + 40, DISPLAY(20), "#d9eed0", "center");
+  }
+}
+
+function grade(p) { return p >= 100 ? "1,0" : GRADES[p] || "5,0"; }
+
+function drawEnd() {
+  ctx.drawImage(img.GameBG, 0, 0, W, H);
+  if (view === "roundEnd") {
+    text("ROUND " + g.round + " END", 40, 200, DISPLAY(30), "#333333");
+    const gr = grade(g.point);
+    text(`You get  ${gr}  in this test`, 350, 390, DIALOG_BOLD(40), "#333333");
+    text(gr === "5,0" ? "Not passed. 60 points needed." : `${g.point} points`, 352, 440, DIALOG_BOLD(22), "#2c5a39");
+    button("Continue", 1000, 400, 200, 50, () => { play("pong"); startRound(g.round + 1); });
+  } else {
+    text("GG", 540, 230, DIALOG_BOLD(88), "#333333");
+    ctx.drawImage(img.meme, 510, 300, 200, 200);
+    button("Another Try", 1000, 400, 200, 50, () => { play("pong"); startRound(1); });
+  }
+  button("MENU", 1000, 500, 200, 50, () => { view = "menu"; focusIdx = 0; });
+}
+
+function drawLoading() {
+  ctx.fillStyle = "#00240c";
+  ctx.fillRect(0, 0, W, H);
+  text("Loading…", W / 2, H / 2, "32px ui-monospace, monospace", "#8fbf96", "center");
+}
+
+function render() {
+  buttons = [];
+  ctx.imageSmoothingEnabled = false;
+  if (view === "loading") drawLoading();
+  else if (view === "menu" || view === "tutorial") drawMenu();
+  else if (view === "game") drawGame();
+  else drawEnd();
+  if (focusIdx >= buttons.length) focusIdx = 0;
+  drawButtons();
+  canvas.style.cursor = hoverIdx >= 0 && hoverIdx < buttons.length ? "pointer" : "default";
+}
+
+// ---- frame loop: requestAnimationFrame is vsync-aligned, dt is clamped so a hidden tab never jumps ----
+const perf = { on: false, gaps: [], steps: [], lastCursor: null };
+let last = 0;
+function frame(t) {
+  const dt = last ? Math.min(t - last, 50) : 16.7;
+  if (perf.on && last) perf.gaps.push(t - last);
+  last = t;
+  if (view === "game" && !paused) {
+    const before = g.cursor;
+    update(dt);
+    if (perf.on) perf.steps.push(g.cursor - before);
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+
+setInterval(() => {
+  if (!perf.on) return;
+  const gaps = perf.gaps.splice(0).sort((a, b) => a - b);
+  const steps = perf.steps.splice(0);
+  if (!gaps.length) return;
+  const mean = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+  const p95 = gaps[Math.floor(gaps.length * 0.95)];
+  let spread = "—";
+  if (steps.length > 2) {
+    const m = steps.reduce((a, b) => a + b, 0) / steps.length;
+    const sd = Math.sqrt(steps.reduce((a, b) => a + (b - m) ** 2, 0) / steps.length);
+    spread = `${m.toFixed(2)} ± ${sd.toFixed(2)} px`;
+  }
+  perfEl.textContent =
+    `fps        ${(1000 / mean).toFixed(1)}\n` +
+    `frame p95  ${p95.toFixed(1)} ms   max ${gaps[gaps.length - 1].toFixed(1)} ms\n` +
+    `scroll     ${spread} / frame`;
+}, 1000);
+
+// ---- canvas sizing: crisp at any devicePixelRatio ----
+function resize() {
+  const r = stage.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  canvas.width = Math.round(r.width * dpr);
+  canvas.height = Math.round(r.height * dpr);
+  ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+}
+new ResizeObserver(resize).observe(stage);
+resize();
+
+// ---- input: jump fires on key DOWN (the Swing version waited for key-up) ----
+function toLogical(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+}
+function buttonAt(p) {
+  return buttons.findIndex(b => p.x >= b.hit[0] && p.x <= b.hit[0] + b.hit[2] && p.y >= b.hit[1] && p.y <= b.hit[1] + b.hit[3]);
+}
+function unlockAudio() { if (audio && audio.state !== "running") audio.resume(); }
+
+canvas.addEventListener("pointerdown", (e) => {
+  unlockAudio();
+  canvas.focus({ preventScroll: true });
+  keyboardFocus = false;
+  if (view === "game") { e.preventDefault(); pressJump(); return; }
+  const i = buttonAt(toLogical(e));
+  if (i >= 0) buttons[i].action();
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (e.pointerType !== "mouse") return;
+  hoverIdx = view === "game" ? -1 : buttonAt(toLogical(e));
+});
+canvas.addEventListener("pointerleave", () => { hoverIdx = -1; });
+
+window.addEventListener("keydown", (e) => {
+  if (e.target instanceof HTMLButtonElement) return;
+  unlockAudio();
+  const key = e.key;
+  if (view === "game") {
+    if (key === " " || key === "ArrowUp" || key === "w" || key === "W") {
+      e.preventDefault();
+      if (!e.repeat) pressJump();
+    } else if (key === "p" || key === "P" || key === "Escape") {
+      paused = !paused;
+    }
+    return;
+  }
+  if (!buttons.length) return;
+  if (key === "Tab" || key === "ArrowDown" || key === "ArrowRight") {
+    e.preventDefault(); keyboardFocus = true; focusIdx = (focusIdx + (e.shiftKey && key === "Tab" ? buttons.length - 1 : 1)) % buttons.length;
+  } else if (key === "ArrowUp" || key === "ArrowLeft") {
+    e.preventDefault(); keyboardFocus = true; focusIdx = (focusIdx + buttons.length - 1) % buttons.length;
+  } else if (key === "Enter" || key === " ") {
+    e.preventDefault(); if (!e.repeat) buttons[focusIdx].action();
+  } else if (key === "Escape" && view === "tutorial") {
+    view = "menu";
+  }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && view === "game") paused = true;
+});
+
+const soundBtn = document.getElementById("soundBtn");
+soundBtn.addEventListener("click", () => {
+  soundOn = !soundOn;
+  soundBtn.setAttribute("aria-pressed", String(soundOn));
+  try { localStorage.setItem("escape-sound", soundOn ? "1" : "0"); } catch (e) {}
+});
+try { if (localStorage.getItem("escape-sound") === "0") { soundOn = false; soundBtn.setAttribute("aria-pressed", "false"); } } catch (e) {}
+
+const perfBtn = document.getElementById("perfBtn");
+perfBtn.addEventListener("click", () => {
+  perf.on = !perf.on;
+  perfBtn.setAttribute("aria-pressed", String(perf.on));
+  perfEl.hidden = !perf.on;
+  perfEl.textContent = "measuring…";
+});
+
+requestAnimationFrame(frame);
+loadAssets().then(() => { view = "menu"; }, () => { view = "menu"; });
+</script>
